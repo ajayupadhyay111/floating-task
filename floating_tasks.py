@@ -2,17 +2,21 @@
 FloatTask - A floating task manager desktop app.
 Single circular button that stays on top of all windows.
 Click to open/close a task management popup panel.
+Supports project hierarchy - tasks organized under projects.
 """
 
 import sys
 import json
 import math
+import tempfile
+import msvcrt
 from pathlib import Path
 
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QScrollArea, QFrame,
-    QCheckBox, QGraphicsDropShadowEffect, QSizePolicy
+    QCheckBox, QGraphicsDropShadowEffect, QSizePolicy, QTextEdit,
+    QStackedWidget
 )
 from PyQt6.QtCore import (
     Qt, QPoint, QTimer, pyqtSignal
@@ -32,12 +36,19 @@ def load_data():
         with open(DATA_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
             if not isinstance(data, dict):
-                return {"tasks": [], "position": None}
-            if "tasks" not in data:
-                data["tasks"] = []
+                return {"projects": [], "position": None}
+            # Migrate old flat task list to project hierarchy
+            if "tasks" in data and "projects" not in data:
+                old_tasks = data["tasks"]
+                data = {
+                    "projects": [{"name": "General", "tasks": old_tasks}],
+                    "position": data.get("position")
+                }
+            if "projects" not in data:
+                data["projects"] = []
             return data
     except (json.JSONDecodeError, FileNotFoundError, OSError):
-        return {"tasks": [], "position": None}
+        return {"projects": [], "position": None}
 
 
 def save_data(data):
@@ -49,11 +60,24 @@ def save_data(data):
 
 
 # ============================================================
+# ClickableLabel
+# ============================================================
+class ClickableLabel(QLabel):
+    clicked = pyqtSignal()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(event)
+
+
+# ============================================================
 # TaskItem
 # ============================================================
 class TaskItem(QWidget):
     toggled = pyqtSignal()
     deleted = pyqtSignal(object)
+    opened = pyqtSignal(object)
 
     def __init__(self, text, done=False, parent=None):
         super().__init__(parent)
@@ -69,7 +93,6 @@ class TaskItem(QWidget):
         layout.setContentsMargins(12, 6, 10, 6)
         layout.setSpacing(10)
 
-        # Custom circle checkbox
         self.checkbox = QCheckBox()
         self.checkbox.setChecked(self.done)
         self.checkbox.setFixedSize(22, 22)
@@ -93,13 +116,13 @@ class TaskItem(QWidget):
         """)
         layout.addWidget(self.checkbox)
 
-        # Task label
-        self.label = QLabel(self.task_text)
+        self.label = ClickableLabel(self.task_text)
         self.label.setWordWrap(True)
         self.label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.label.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.label.clicked.connect(lambda: self.opened.emit(self))
         layout.addWidget(self.label)
 
-        # Delete button
         self.del_btn = QPushButton("\u2212")
         self.del_btn.setFixedSize(26, 26)
         self.del_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
@@ -146,6 +169,10 @@ class TaskItem(QWidget):
         self.del_btn.setVisible(False)
         super().leaveEvent(event)
 
+    def set_text(self, text):
+        self.task_text = text
+        self.label.setText(text)
+
     def to_dict(self):
         return {"text": self.task_text, "done": self.done}
 
@@ -169,7 +196,311 @@ class TaskItem(QWidget):
 
 
 # ============================================================
-# PopupPanel
+# ProjectItem - clickable project row
+# ============================================================
+class ProjectItem(QWidget):
+    clicked = pyqtSignal(object)
+    deleted = pyqtSignal(object)
+
+    def __init__(self, name, task_count=0, pending_count=0, parent=None):
+        super().__init__(parent)
+        self.project_name = name
+        self.task_count = task_count
+        self.pending_count = pending_count
+        self.setFixedHeight(52)
+        self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self._build_ui()
+
+    def _build_ui(self):
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(14, 8, 12, 8)
+        layout.setSpacing(10)
+
+        # Folder icon
+        icon = QLabel("\U0001F4C1")
+        icon.setFixedSize(24, 24)
+        icon.setStyleSheet("font-size: 16px; background: transparent;")
+        layout.addWidget(icon)
+
+        # Name + count column
+        text_layout = QVBoxLayout()
+        text_layout.setSpacing(2)
+
+        self.name_label = QLabel(self.project_name)
+        self.name_label.setStyleSheet(
+            "color: #e2e0f0; font-size: 14px; font-weight: bold;"
+            "font-family: 'Segoe UI'; background: transparent;"
+        )
+        text_layout.addWidget(self.name_label)
+
+        self.count_label = QLabel(self._count_text())
+        self.count_label.setStyleSheet(
+            "color: #5a5a7a; font-size: 11px; font-family: 'Segoe UI'; background: transparent;"
+        )
+        text_layout.addWidget(self.count_label)
+
+        layout.addLayout(text_layout, 1)
+
+        # Badge for pending
+        if self.pending_count > 0:
+            badge = QLabel(str(self.pending_count))
+            badge.setFixedSize(24, 24)
+            badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            badge.setStyleSheet("""
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #a78bfa, stop:1 #6366f1);
+                color: white; font-size: 11px; font-weight: bold;
+                font-family: 'Segoe UI'; border-radius: 12px;
+            """)
+            layout.addWidget(badge)
+
+        # Arrow
+        arrow = QLabel("\u203A")
+        arrow.setStyleSheet("color: #4a4a6a; font-size: 18px; background: transparent;")
+        layout.addWidget(arrow)
+
+        # Delete btn
+        self.del_btn = QPushButton("\u2212")
+        self.del_btn.setFixedSize(26, 26)
+        self.del_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.del_btn.clicked.connect(lambda: self.deleted.emit(self))
+        self.del_btn.setStyleSheet("""
+            QPushButton {
+                background: transparent;
+                color: #ef4444;
+                border: 1px solid transparent;
+                font-size: 16px;
+                font-weight: bold;
+                border-radius: 13px;
+            }
+            QPushButton:hover {
+                background: rgba(239, 68, 68, 0.12);
+                border: 1px solid rgba(239, 68, 68, 0.3);
+            }
+        """)
+        self.del_btn.setVisible(False)
+        layout.addWidget(self.del_btn)
+
+    def _count_text(self):
+        if self.task_count == 0:
+            return "No tasks"
+        return f"{self.pending_count} pending \u00b7 {self.task_count - self.pending_count} done"
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit(self)
+
+    def enterEvent(self, event):
+        self.del_btn.setVisible(True)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self.del_btn.setVisible(False)
+        super().leaveEvent(event)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rect = self.rect().adjusted(2, 1, -2, -1)
+
+        if self.underMouse():
+            painter.setBrush(QColor(167, 139, 250, 18))
+            painter.setPen(QPen(QColor(167, 139, 250, 50), 1))
+        else:
+            painter.setBrush(QColor(255, 255, 255, 8))
+            painter.setPen(QPen(QColor(255, 255, 255, 15), 1))
+
+        painter.drawRoundedRect(rect, 12, 12)
+        painter.end()
+
+
+# ============================================================
+# TaskDetailOverlay
+# ============================================================
+class TaskDetailOverlay(QWidget):
+    saved = pyqtSignal(object, str)
+    closed = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._task_item = None
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, False)
+        self._build_ui()
+        self.hide()
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 18, 20, 16)
+        layout.setSpacing(12)
+
+        header = QHBoxLayout()
+        header.setSpacing(8)
+
+        title = QLabel("Edit task")
+        title.setStyleSheet(
+            "color: #e2e0f0; font-size: 15px; font-weight: bold;"
+            "font-family: 'Segoe UI'; letter-spacing: 0.5px;"
+            "background: transparent;"
+        )
+        header.addWidget(title)
+        header.addStretch()
+
+        close_btn = QPushButton("\u00d7")
+        close_btn.setFixedSize(30, 30)
+        close_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        close_btn.clicked.connect(self._on_close)
+        close_btn.setStyleSheet("""
+            QPushButton {
+                background: rgba(255,255,255,0.04);
+                color: #888;
+                border: none;
+                border-radius: 15px;
+                font-size: 18px;
+                font-family: 'Segoe UI';
+            }
+            QPushButton:hover {
+                background: rgba(239, 68, 68, 0.15);
+                color: #ef4444;
+            }
+        """)
+        header.addWidget(close_btn)
+        layout.addLayout(header)
+
+        sep = QFrame()
+        sep.setFixedHeight(1)
+        sep.setStyleSheet("background: rgba(167, 139, 250, 0.1);")
+        layout.addWidget(sep)
+
+        self.text_edit = QTextEdit()
+        self.text_edit.setStyleSheet("""
+            QTextEdit {
+                background: rgba(255,255,255,0.04);
+                color: #d4d4e8;
+                border: 1px solid rgba(167,139,250,0.12);
+                border-radius: 12px;
+                padding: 10px 12px;
+                font-size: 13px;
+                font-family: 'Segoe UI';
+                selection-background-color: #6366f1;
+            }
+            QTextEdit:focus {
+                border-color: rgba(167,139,250,0.4);
+                background: rgba(167,139,250,0.06);
+            }
+            QScrollBar:vertical {
+                background: transparent;
+                width: 4px;
+                margin: 4px 0;
+            }
+            QScrollBar::handle:vertical {
+                background: rgba(167,139,250,0.25);
+                border-radius: 2px;
+                min-height: 30px;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical,
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+                background: transparent;
+                height: 0;
+            }
+        """)
+        layout.addWidget(self.text_edit, 1)
+
+        footer = QHBoxLayout()
+        footer.addStretch()
+
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.setFixedHeight(34)
+        cancel_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        cancel_btn.clicked.connect(self._on_close)
+        cancel_btn.setStyleSheet("""
+            QPushButton {
+                background: transparent;
+                color: #9ca3af;
+                border: 1px solid rgba(255,255,255,0.08);
+                border-radius: 10px;
+                padding: 0 16px;
+                font-size: 12px;
+                font-family: 'Segoe UI';
+            }
+            QPushButton:hover {
+                background: rgba(255,255,255,0.05);
+                color: #d4d4e8;
+            }
+        """)
+        footer.addWidget(cancel_btn)
+
+        save_btn = QPushButton("Save")
+        save_btn.setFixedHeight(34)
+        save_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        save_btn.clicked.connect(self._on_save)
+        save_btn.setStyleSheet("""
+            QPushButton {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #a78bfa, stop:1 #6366f1);
+                color: white;
+                border: none;
+                border-radius: 10px;
+                padding: 0 20px;
+                font-size: 12px;
+                font-weight: bold;
+                font-family: 'Segoe UI';
+            }
+            QPushButton:hover {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #b89dff, stop:1 #7577ff);
+            }
+            QPushButton:pressed {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #9678e6, stop:1 #5558d9);
+            }
+        """)
+        footer.addWidget(save_btn)
+        layout.addLayout(footer)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        for i in range(5):
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QPen(QColor(0, 0, 0, 12 - i * 2), 1))
+            painter.drawRoundedRect(self.rect().adjusted(i, i, -i, -i), 20, 20)
+
+        painter.setPen(QPen(QColor(167, 139, 250, 60), 1))
+        painter.setBrush(QColor(13, 13, 25, 252))
+        painter.drawRoundedRect(self.rect().adjusted(5, 5, -5, -5), 18, 18)
+        painter.end()
+
+    def open_for(self, task_item):
+        self._task_item = task_item
+        self.text_edit.setPlainText(task_item.task_text)
+        if self.parent() is not None:
+            self.setGeometry(self.parent().rect())
+        self.show()
+        self.raise_()
+        self.text_edit.setFocus()
+        cursor = self.text_edit.textCursor()
+        cursor.movePosition(cursor.MoveOperation.End)
+        self.text_edit.setTextCursor(cursor)
+
+    def _on_save(self):
+        new_text = self.text_edit.toPlainText().strip()
+        if new_text and self._task_item is not None:
+            self.saved.emit(self._task_item, new_text)
+        self._task_item = None
+        self.hide()
+        self.closed.emit()
+
+    def _on_close(self):
+        self._task_item = None
+        self.hide()
+        self.closed.emit()
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape:
+            self._on_close()
+            return
+        super().keyPressEvent(event)
+
+
+# ============================================================
+# PopupPanel - with project/task navigation
 # ============================================================
 class PopupPanel(QWidget):
     closed = pyqtSignal()
@@ -187,30 +518,34 @@ class PopupPanel(QWidget):
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setFixedSize(self.PANEL_W, self.PANEL_H)
-        self.task_items = []
+
+        # Data
+        self.projects = []  # list of {"name": str, "tasks": list}
+        self._current_project_idx = None
+
         self._build_ui()
 
+        # Detail overlay
+        self.detail = TaskDetailOverlay(self)
+        self.detail.saved.connect(self._on_detail_saved)
+        self.detail.setGeometry(self.rect())
+
     def paintEvent(self, event):
-        """Draw dark rounded background manually to avoid white leaks."""
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
-        # Shadow layers
         for i in range(5):
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.setPen(QPen(QColor(0, 0, 0, 12 - i * 2), 1))
             painter.drawRoundedRect(self.rect().adjusted(i, i, -i, -i), 20, 20)
 
-        # Main background
         painter.setPen(QPen(QColor(167, 139, 250, 40), 1))
         painter.setBrush(QColor(13, 13, 25, 248))
         painter.drawRoundedRect(self.rect().adjusted(5, 5, -5, -5), 18, 18)
 
-        # Top accent line
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QColor(167, 139, 250, 25))
         painter.drawRoundedRect(self.rect().adjusted(20, 6, -20, -(self.PANEL_H - 9)), 2, 2)
-
         painter.end()
 
     def _build_ui(self):
@@ -219,25 +554,44 @@ class PopupPanel(QWidget):
         main_layout.setSpacing(12)
 
         # --- Header ---
-        header = QHBoxLayout()
-        header.setSpacing(8)
+        self.header_layout = QHBoxLayout()
+        self.header_layout.setSpacing(8)
 
-        # App icon - small purple dot
+        self.back_btn = QPushButton("\u2039")
+        self.back_btn.setFixedSize(30, 30)
+        self.back_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.back_btn.clicked.connect(self._go_back)
+        self.back_btn.setStyleSheet("""
+            QPushButton {
+                background: rgba(255,255,255,0.04);
+                color: #a78bfa;
+                border: none;
+                border-radius: 15px;
+                font-size: 20px;
+                font-family: 'Segoe UI';
+            }
+            QPushButton:hover {
+                background: rgba(167,139,250,0.12);
+            }
+        """)
+        self.back_btn.setVisible(False)
+        self.header_layout.addWidget(self.back_btn)
+
         icon_dot = QLabel()
         icon_dot.setFixedSize(10, 10)
         icon_dot.setStyleSheet("""
             background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #a78bfa, stop:1 #6366f1);
             border-radius: 5px;
         """)
-        header.addWidget(icon_dot)
+        self.header_layout.addWidget(icon_dot)
 
-        title = QLabel("FloatTask")
-        title.setStyleSheet(
+        self.title_label = QLabel("FloatTask")
+        self.title_label.setStyleSheet(
             "color: #e2e0f0; font-size: 15px; font-weight: bold;"
             "font-family: 'Segoe UI'; letter-spacing: 0.5px;"
         )
-        header.addWidget(title)
-        header.addStretch()
+        self.header_layout.addWidget(self.title_label)
+        self.header_layout.addStretch()
 
         close_btn = QPushButton("\u00d7")
         close_btn.setFixedSize(30, 30)
@@ -257,23 +611,23 @@ class PopupPanel(QWidget):
                 color: #ef4444;
             }
         """)
-        header.addWidget(close_btn)
-        main_layout.addLayout(header)
+        self.header_layout.addWidget(close_btn)
+        main_layout.addLayout(self.header_layout)
 
-        # --- Separator ---
+        # Separator
         sep = QFrame()
         sep.setFixedHeight(1)
         sep.setStyleSheet("background: rgba(167, 139, 250, 0.1);")
         main_layout.addWidget(sep)
 
         # --- Input row ---
-        input_row = QHBoxLayout()
-        input_row.setSpacing(8)
+        self.input_row = QHBoxLayout()
+        self.input_row.setSpacing(8)
 
         self.input_field = QLineEdit()
-        self.input_field.setPlaceholderText("What needs to be done?")
+        self.input_field.setPlaceholderText("New project name...")
         self.input_field.setFixedHeight(40)
-        self.input_field.returnPressed.connect(self._add_task)
+        self.input_field.returnPressed.connect(self._on_add)
         self.input_field.setStyleSheet("""
             QLineEdit {
                 background: rgba(255,255,255,0.04);
@@ -293,13 +647,13 @@ class PopupPanel(QWidget):
                 color: #4a4a60;
             }
         """)
-        input_row.addWidget(self.input_field)
+        self.input_row.addWidget(self.input_field)
 
-        add_btn = QPushButton("+")
-        add_btn.setFixedSize(40, 40)
-        add_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        add_btn.clicked.connect(self._add_task)
-        add_btn.setStyleSheet("""
+        self.add_btn = QPushButton("+")
+        self.add_btn.setFixedSize(40, 40)
+        self.add_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.add_btn.clicked.connect(self._on_add)
+        self.add_btn.setStyleSheet("""
             QPushButton {
                 background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #a78bfa, stop:1 #6366f1);
                 color: white;
@@ -316,10 +670,13 @@ class PopupPanel(QWidget):
                 background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #9678e6, stop:1 #5558d9);
             }
         """)
-        input_row.addWidget(add_btn)
-        main_layout.addLayout(input_row)
+        self.input_row.addWidget(self.add_btn)
 
-        # --- Scrollable task list ---
+        input_widget = QWidget()
+        input_widget.setLayout(self.input_row)
+        main_layout.addWidget(input_widget)
+
+        # --- Scrollable content ---
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
         self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -352,25 +709,24 @@ class PopupPanel(QWidget):
             }
         """)
 
-        self.task_container = QWidget()
-        self.task_layout = QVBoxLayout(self.task_container)
-        self.task_layout.setContentsMargins(0, 4, 0, 4)
-        self.task_layout.setSpacing(4)
-        self.task_layout.addStretch()
+        self.list_container = QWidget()
+        self.list_layout = QVBoxLayout(self.list_container)
+        self.list_layout.setContentsMargins(0, 4, 0, 4)
+        self.list_layout.setSpacing(4)
+        self.list_layout.addStretch()
 
-        self.scroll.setWidget(self.task_container)
+        self.scroll.setWidget(self.list_container)
         main_layout.addWidget(self.scroll)
 
-        # --- Footer separator ---
+        # --- Footer ---
         sep2 = QFrame()
         sep2.setFixedHeight(1)
         sep2.setStyleSheet("background: rgba(167, 139, 250, 0.08);")
         main_layout.addWidget(sep2)
 
-        # --- Footer ---
         footer = QHBoxLayout()
         footer.setContentsMargins(4, 2, 4, 0)
-        self.status_label = QLabel("0 pending \u00b7 0 done")
+        self.status_label = QLabel("")
         self.status_label.setStyleSheet(
             "color: #4a4a60; font-size: 11px; font-family: 'Segoe UI';"
         )
@@ -395,72 +751,182 @@ class PopupPanel(QWidget):
                 color: #a78bfa;
             }
         """)
+        self.clear_btn.setVisible(False)
         footer.addWidget(self.clear_btn)
         main_layout.addLayout(footer)
 
-    def load_tasks(self, tasks):
-        for t in tasks:
-            self._create_task_widget(t["text"], t.get("done", False))
-        self._update_footer()
+    # --- Data loading ---
+    def load_projects(self, projects):
+        self.projects = projects
+        self._show_projects_view()
 
-    def _add_task(self):
+    def _show_projects_view(self):
+        self._current_project_idx = None
+        self.back_btn.setVisible(False)
+        self.title_label.setText("FloatTask")
+        self.input_field.setPlaceholderText("New project name...")
+        self.clear_btn.setVisible(False)
+        self._clear_list()
+
+        for i, proj in enumerate(self.projects):
+            pending = sum(1 for t in proj["tasks"] if not t.get("done", False))
+            item = ProjectItem(proj["name"], len(proj["tasks"]), pending)
+            item.clicked.connect(self._open_project)
+            item.deleted.connect(self._delete_project)
+            self.list_layout.insertWidget(self.list_layout.count() - 1, item)
+
+        total_projects = len(self.projects)
+        total_pending = sum(
+            1 for p in self.projects for t in p["tasks"] if not t.get("done", False)
+        )
+        self.status_label.setText(f"{total_projects} projects \u00b7 {total_pending} pending")
+
+    def _show_tasks_view(self, project_idx):
+        self._current_project_idx = project_idx
+        proj = self.projects[project_idx]
+        self.back_btn.setVisible(True)
+        self.title_label.setText(proj["name"])
+        self.input_field.setPlaceholderText("What needs to be done?")
+        self.clear_btn.setVisible(True)
+        self._clear_list()
+
+        self._task_items = []
+        for t in proj["tasks"]:
+            self._create_task_widget(t["text"], t.get("done", False))
+        self._update_task_footer()
+
+    def _clear_list(self):
+        while self.list_layout.count() > 1:
+            item = self.list_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+    # --- Project actions ---
+    def _on_add(self):
         text = self.input_field.text().strip()
         if not text:
             return
         self.input_field.clear()
-        self._create_task_widget(text, False)
-        self._update_footer()
+
+        if self._current_project_idx is None:
+            # Add project
+            self.projects.append({"name": text, "tasks": []})
+            self._show_projects_view()
+        else:
+            # Add task
+            self._create_task_widget(text, False)
+            self._update_task_footer()
+
         self.data_changed.emit()
 
+    def _open_project(self, item):
+        for i, proj in enumerate(self.projects):
+            if proj["name"] == item.project_name:
+                self._show_tasks_view(i)
+                return
+
+    def _delete_project(self, item):
+        for i, proj in enumerate(self.projects):
+            if proj["name"] == item.project_name:
+                self.projects.pop(i)
+                break
+        self._show_projects_view()
+        self.data_changed.emit()
+
+    def _go_back(self):
+        # Save current tasks back to project data
+        if self._current_project_idx is not None:
+            self._sync_tasks_to_data()
+        self._show_projects_view()
+
+    # --- Task actions ---
     def _create_task_widget(self, text, done):
         item = TaskItem(text, done)
         item.toggled.connect(self._on_task_changed)
         item.deleted.connect(self._delete_task)
-        self.task_items.append(item)
-        self.task_layout.insertWidget(self.task_layout.count() - 1, item)
+        item.opened.connect(self._open_detail)
+        if not hasattr(self, '_task_items'):
+            self._task_items = []
+        self._task_items.append(item)
+        self.list_layout.insertWidget(self.list_layout.count() - 1, item)
         self._sort_tasks()
+
+    def _open_detail(self, item):
+        self.detail.open_for(item)
+
+    def _on_detail_saved(self, item, new_text):
+        item.set_text(new_text)
+        self._sync_tasks_to_data()
+        self.data_changed.emit()
 
     def _on_task_changed(self):
         self._sort_tasks()
-        self._update_footer()
+        self._update_task_footer()
+        self._sync_tasks_to_data()
         self.data_changed.emit()
 
     def _delete_task(self, item):
-        self.task_items.remove(item)
-        self.task_layout.removeWidget(item)
+        self._task_items.remove(item)
+        self.list_layout.removeWidget(item)
         item.deleteLater()
-        self._update_footer()
+        self._update_task_footer()
+        self._sync_tasks_to_data()
         self.data_changed.emit()
 
     def _clear_done(self):
-        done_items = [i for i in self.task_items if i.done]
+        if not hasattr(self, '_task_items'):
+            return
+        done_items = [i for i in self._task_items if i.done]
         for item in done_items:
-            self.task_items.remove(item)
-            self.task_layout.removeWidget(item)
+            self._task_items.remove(item)
+            self.list_layout.removeWidget(item)
             item.deleteLater()
-        self._update_footer()
+        self._update_task_footer()
+        self._sync_tasks_to_data()
         self.data_changed.emit()
 
     def _sort_tasks(self):
-        for item in self.task_items:
-            self.task_layout.removeWidget(item)
-        pending = [i for i in self.task_items if not i.done]
-        done = [i for i in self.task_items if i.done]
+        if not hasattr(self, '_task_items'):
+            return
+        for item in self._task_items:
+            self.list_layout.removeWidget(item)
+        pending = [i for i in self._task_items if not i.done]
+        done = [i for i in self._task_items if i.done]
         for i, item in enumerate(pending + done):
-            self.task_layout.insertWidget(i, item)
+            self.list_layout.insertWidget(i, item)
 
-    def _update_footer(self):
-        pending = sum(1 for i in self.task_items if not i.done)
-        done = sum(1 for i in self.task_items if i.done)
+    def _update_task_footer(self):
+        if not hasattr(self, '_task_items'):
+            return
+        pending = sum(1 for i in self._task_items if not i.done)
+        done = sum(1 for i in self._task_items if i.done)
         self.status_label.setText(f"{pending} pending \u00b7 {done} done")
 
-    def get_tasks_data(self):
-        return [i.to_dict() for i in self.task_items]
+    def _sync_tasks_to_data(self):
+        if self._current_project_idx is not None and hasattr(self, '_task_items'):
+            self.projects[self._current_project_idx]["tasks"] = [
+                i.to_dict() for i in self._task_items
+            ]
 
-    def get_pending_count(self):
-        return sum(1 for i in self.task_items if not i.done)
+    # --- Public API ---
+    def get_all_pending_count(self):
+        return sum(
+            1 for p in self.projects for t in p["tasks"] if not t.get("done", False)
+        )
+
+    def get_projects_data(self):
+        # Make sure current view is synced
+        if self._current_project_idx is not None and hasattr(self, '_task_items'):
+            self._sync_tasks_to_data()
+        return self.projects
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "detail"):
+            self.detail.setGeometry(self.rect())
 
     def _close(self):
+        self._sync_tasks_to_data()
         self.closed.emit()
 
     def show_at(self, circle_pos, circle_size):
@@ -514,10 +980,10 @@ class FloatingCircle(QWidget):
 
         # Load saved data
         data = load_data()
-        self.panel.load_tasks(data.get("tasks", []))
-        self._pending_count = self.panel.get_pending_count()
+        self.panel.load_projects(data.get("projects", []))
+        self._pending_count = self.panel.get_all_pending_count()
 
-        # Restore position or default to top-right
+        # Restore position
         pos = data.get("position")
         if pos and isinstance(pos, list) and len(pos) == 2:
             self.move(pos[0], pos[1])
@@ -553,7 +1019,6 @@ class FloatingCircle(QWidget):
         cy = self.height() / 2
         r = self.CIRCLE_SIZE / 2
 
-        # Soft outer glow (breathing)
         glow_strength = 0.5 + 0.5 * math.sin(self._glow_phase)
         for i in range(3):
             alpha = int((15 + 10 * glow_strength) * (3 - i) / 3)
@@ -562,7 +1027,6 @@ class FloatingCircle(QWidget):
             painter.drawEllipse(int(cx - r - 2 - i), int(cy - r - 2 - i),
                                 int((r + 2 + i) * 2), int((r + 2 + i) * 2))
 
-        # Main circle gradient
         gradient = QRadialGradient(cx - 4, cy - 6, r * 1.2)
         if self._hover:
             gradient.setColorAt(0, QColor(55, 40, 110, 250))
@@ -577,7 +1041,6 @@ class FloatingCircle(QWidget):
         painter.setBrush(QBrush(gradient))
         painter.drawEllipse(int(cx - r), int(cy - r), int(r * 2), int(r * 2))
 
-        # Border ring
         ring_alpha = int(80 + 40 * glow_strength)
         if self._hover:
             ring_alpha = min(ring_alpha + 40, 200)
@@ -586,9 +1049,7 @@ class FloatingCircle(QWidget):
         painter.drawEllipse(int(cx - r + 1), int(cy - r + 1),
                             int((r - 1) * 2), int((r - 1) * 2))
 
-        # Center content
         if self._pending_count > 0:
-            # Badge count
             painter.setPen(QColor(220, 210, 255))
             font = QFont("Segoe UI", 17, QFont.Weight.Bold)
             painter.setFont(font)
@@ -596,14 +1057,12 @@ class FloatingCircle(QWidget):
             painter.drawText(QRectF(0, 0, self.width(), self.height()),
                              Qt.AlignmentFlag.AlignCenter, str(self._pending_count))
         else:
-            # Checkmark
             painter.setPen(QPen(QColor(99, 102, 241), 2.5))
             painter.drawLine(int(cx - 6), int(cy + 1), int(cx - 1), int(cy + 6))
             painter.drawLine(int(cx - 1), int(cy + 6), int(cx + 8), int(cy - 5))
 
         painter.end()
 
-    # --- Mouse events ---
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
             self._dragging = True
@@ -636,7 +1095,7 @@ class FloatingCircle(QWidget):
         self._panel_visible = False
 
     def _on_data_changed(self):
-        self._pending_count = self.panel.get_pending_count()
+        self._pending_count = self.panel.get_all_pending_count()
         self.update()
         self._save_all()
 
@@ -645,7 +1104,7 @@ class FloatingCircle(QWidget):
 
     def _save_all(self):
         data = {
-            "tasks": self.panel.get_tasks_data(),
+            "projects": self.panel.get_projects_data(),
             "position": [self.pos().x(), self.pos().y()]
         }
         save_data(data)
@@ -654,7 +1113,25 @@ class FloatingCircle(QWidget):
 # ============================================================
 # Main
 # ============================================================
+def acquire_single_instance_lock():
+    """Acquire a lock file to prevent multiple instances. Returns file handle or None."""
+    lock_path = Path(tempfile.gettempdir()) / "floattask.lock"
+    try:
+        lock_file = open(lock_path, "w")
+        msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+        lock_file.write(str(sys.executable))
+        lock_file.flush()
+        return lock_file
+    except (OSError, IOError):
+        return None
+
+
 def main():
+    lock = acquire_single_instance_lock()
+    if lock is None:
+        print("FloatTask already running.")
+        sys.exit(0)
+
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
     circle = FloatingCircle()
