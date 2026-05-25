@@ -10,6 +10,11 @@ import json
 import math
 import tempfile
 import msvcrt
+import sqlite3
+import ctypes
+import ctypes.wintypes
+import base64
+from datetime import datetime
 from pathlib import Path
 
 from PyQt6.QtWidgets import (
@@ -27,36 +32,297 @@ from PyQt6.QtGui import (
 )
 
 
-# --- Data file path ---
+# --- Data file paths ---
 DATA_FILE = Path.home() / "floating_tasks_data.json"
+ONEDRIVE_DIR = Path.home() / "OneDrive" / "Documents"
+DB_FILE = ONEDRIVE_DIR / "floattask.db" if ONEDRIVE_DIR.exists() else Path.home() / "floattask.db"
+
+
+# --- Windows DPAPI encryption ---
+class DATA_BLOB(ctypes.Structure):
+    _fields_ = [("cbData", ctypes.wintypes.DWORD),
+                ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+def _dpapi_encrypt(plaintext: str) -> str:
+    data = plaintext.encode("utf-8")
+    blob_in = DATA_BLOB(len(data), ctypes.create_string_buffer(data, len(data)))
+    blob_out = DATA_BLOB()
+    if ctypes.windll.crypt32.CryptProtectData(
+        ctypes.byref(blob_in), None, None, None, None, 0, ctypes.byref(blob_out)
+    ):
+        encrypted = ctypes.string_at(blob_out.pbData, blob_out.cbData)
+        ctypes.windll.kernel32.LocalFree(blob_out.pbData)
+        return base64.b64encode(encrypted).decode("ascii")
+    return plaintext
+
+def _dpapi_decrypt(encrypted_b64: str) -> str:
+    try:
+        data = base64.b64decode(encrypted_b64)
+    except Exception:
+        return encrypted_b64
+    blob_in = DATA_BLOB(len(data), ctypes.create_string_buffer(data, len(data)))
+    blob_out = DATA_BLOB()
+    if ctypes.windll.crypt32.CryptUnprotectData(
+        ctypes.byref(blob_in), None, None, None, None, 0, ctypes.byref(blob_out)
+    ):
+        decrypted = ctypes.string_at(blob_out.pbData, blob_out.cbData)
+        ctypes.windll.kernel32.LocalFree(blob_out.pbData)
+        return decrypted.decode("utf-8")
+    return encrypted_b64
+
+
+# ============================================================
+# SQLite Database Layer
+# ============================================================
+class FloatTaskDB:
+    def __init__(self):
+        self.conn = sqlite3.connect(str(DB_FILE))
+        self.conn.execute("PRAGMA journal_mode=DELETE")
+        self._create_tables()
+        self._migrate_json_if_needed()
+
+    def _create_tables(self):
+        self.conn.executescript("""
+            CREATE TABLE IF NOT EXISTS projects (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+                deleted_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id INTEGER NOT NULL,
+                text TEXT NOT NULL,
+                done INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+                completed_at TEXT,
+                deleted_at TEXT,
+                FOREIGN KEY (project_id) REFERENCES projects(id)
+            );
+            CREATE TABLE IF NOT EXISTS task_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id INTEGER,
+                project_id INTEGER,
+                action TEXT NOT NULL,
+                detail TEXT,
+                timestamp TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+            );
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            );
+            CREATE TABLE IF NOT EXISTS credentials (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                company TEXT NOT NULL,
+                username TEXT NOT NULL,
+                password_enc TEXT NOT NULL,
+                url TEXT DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+                deleted_at TEXT
+            );
+        """)
+        self.conn.commit()
+
+    def _migrate_json_if_needed(self):
+        cursor = self.conn.execute("SELECT COUNT(*) FROM projects WHERE deleted_at IS NULL")
+        if cursor.fetchone()[0] > 0:
+            return
+        if not DATA_FILE.exists():
+            return
+        try:
+            with open(DATA_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                return
+            if "tasks" in data and "projects" not in data:
+                data = {"projects": [{"name": "General", "tasks": data["tasks"]}],
+                        "position": data.get("position")}
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            for proj in data.get("projects", []):
+                cur = self.conn.execute(
+                    "INSERT INTO projects (name, created_at) VALUES (?, ?)",
+                    (proj["name"], now))
+                pid = cur.lastrowid
+                for task in proj.get("tasks", []):
+                    done = 1 if task.get("done", False) else 0
+                    comp = now if done else None
+                    self.conn.execute(
+                        "INSERT INTO tasks (project_id, text, done, created_at, completed_at) VALUES (?, ?, ?, ?, ?)",
+                        (pid, task["text"], done, now, comp))
+            if data.get("position"):
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                    ("position", json.dumps(data["position"])))
+            self.conn.commit()
+            self._log("system", None, None, "migrated_from_json")
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    def _log(self, action, task_id, project_id, detail=None):
+        self.conn.execute(
+            "INSERT INTO task_history (task_id, project_id, action, detail) VALUES (?, ?, ?, ?)",
+            (task_id, project_id, action, detail))
+
+    # --- Projects ---
+    def get_projects(self):
+        rows = self.conn.execute(
+            "SELECT id, name FROM projects WHERE deleted_at IS NULL ORDER BY id").fetchall()
+        projects = []
+        for pid, name in rows:
+            tasks = self.conn.execute(
+                "SELECT text, done FROM tasks WHERE project_id=? AND deleted_at IS NULL ORDER BY id",
+                (pid,)).fetchall()
+            projects.append({
+                "id": pid, "name": name,
+                "tasks": [{"text": t, "done": bool(d)} for t, d in tasks]
+            })
+        return projects
+
+    def add_project(self, name):
+        cur = self.conn.execute("INSERT INTO projects (name) VALUES (?)", (name,))
+        self.conn.commit()
+        self._log("project_created", None, cur.lastrowid)
+        self.conn.commit()
+        return cur.lastrowid
+
+    def delete_project(self, project_id):
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.conn.execute("UPDATE projects SET deleted_at=? WHERE id=?", (now, project_id))
+        self.conn.execute("UPDATE tasks SET deleted_at=? WHERE project_id=? AND deleted_at IS NULL",
+                          (now, project_id))
+        self._log("project_deleted", None, project_id)
+        self.conn.commit()
+
+    def get_project_id_by_name(self, name):
+        row = self.conn.execute(
+            "SELECT id FROM projects WHERE name=? AND deleted_at IS NULL", (name,)).fetchone()
+        return row[0] if row else None
+
+    # --- Tasks ---
+    def add_task(self, project_id, text):
+        cur = self.conn.execute(
+            "INSERT INTO tasks (project_id, text) VALUES (?, ?)", (project_id, text))
+        self.conn.commit()
+        self._log("task_created", cur.lastrowid, project_id, text)
+        self.conn.commit()
+        return cur.lastrowid
+
+    def toggle_task(self, project_id, text, done):
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        comp = now if done else None
+        self.conn.execute(
+            "UPDATE tasks SET done=?, completed_at=? WHERE project_id=? AND text=? AND deleted_at IS NULL",
+            (1 if done else 0, comp, project_id, text))
+        action = "task_completed" if done else "task_uncompleted"
+        self._log(action, None, project_id, text)
+        self.conn.commit()
+
+    def delete_task(self, project_id, text):
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.conn.execute(
+            "UPDATE tasks SET deleted_at=? WHERE project_id=? AND text=? AND deleted_at IS NULL",
+            (now, project_id, text))
+        self._log("task_deleted", None, project_id, text)
+        self.conn.commit()
+
+    def update_task_text(self, project_id, old_text, new_text):
+        self.conn.execute(
+            "UPDATE tasks SET text=? WHERE project_id=? AND text=? AND deleted_at IS NULL",
+            (new_text, project_id, old_text))
+        self._log("task_edited", None, project_id, f"{old_text} -> {new_text}")
+        self.conn.commit()
+
+    def clear_done_tasks(self, project_id):
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.conn.execute(
+            "UPDATE tasks SET deleted_at=? WHERE project_id=? AND done=1 AND deleted_at IS NULL",
+            (now, project_id))
+        self._log("cleared_done", None, project_id)
+        self.conn.commit()
+
+    def get_task_created_at(self, project_id, text):
+        row = self.conn.execute(
+            "SELECT created_at FROM tasks WHERE project_id=? AND text=? AND deleted_at IS NULL",
+            (project_id, text)).fetchone()
+        return row[0] if row else None
+
+    # --- Credentials ---
+    def get_credentials(self):
+        rows = self.conn.execute(
+            "SELECT id, company, username, password_enc, url, created_at FROM credentials WHERE deleted_at IS NULL ORDER BY id DESC"
+        ).fetchall()
+        return [{"id": r[0], "company": r[1], "username": r[2],
+                 "password_enc": r[3], "url": r[4], "created_at": r[5]} for r in rows]
+
+    def add_credential(self, company, username, password, url=""):
+        enc = _dpapi_encrypt(password)
+        cur = self.conn.execute(
+            "INSERT INTO credentials (company, username, password_enc, url) VALUES (?, ?, ?, ?)",
+            (company, username, enc, url))
+        self.conn.commit()
+        return cur.lastrowid
+
+    def update_credential(self, cred_id, company, username, password, url=""):
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        enc = _dpapi_encrypt(password)
+        self.conn.execute(
+            "UPDATE credentials SET company=?, username=?, password_enc=?, url=?, updated_at=? WHERE id=?",
+            (company, username, enc, url, now, cred_id))
+        self.conn.commit()
+
+    def delete_credential(self, cred_id):
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.conn.execute("UPDATE credentials SET deleted_at=? WHERE id=?", (now, cred_id))
+        self.conn.commit()
+
+    def decrypt_password(self, password_enc):
+        return _dpapi_decrypt(password_enc)
+
+    # --- Settings ---
+    def get_position(self):
+        row = self.conn.execute("SELECT value FROM settings WHERE key='position'").fetchone()
+        if row:
+            try:
+                return json.loads(row[0])
+            except (json.JSONDecodeError, TypeError):
+                pass
+        return None
+
+    def save_position(self, pos):
+        self.conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+            ("position", json.dumps(pos)))
+        self.conn.commit()
+
+    def save_all(self, projects, position):
+        self.save_position(position)
+        self.conn.commit()
+
+    def close(self):
+        self.conn.close()
+
+
+# Global DB instance
+_db = None
+
+def get_db():
+    global _db
+    if _db is None:
+        _db = FloatTaskDB()
+    return _db
 
 
 def load_data():
-    try:
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            if not isinstance(data, dict):
-                return {"projects": [], "position": None}
-            # Migrate old flat task list to project hierarchy
-            if "tasks" in data and "projects" not in data:
-                old_tasks = data["tasks"]
-                data = {
-                    "projects": [{"name": "General", "tasks": old_tasks}],
-                    "position": data.get("position")
-                }
-            if "projects" not in data:
-                data["projects"] = []
-            return data
-    except (json.JSONDecodeError, FileNotFoundError, OSError):
-        return {"projects": [], "position": None}
+    db = get_db()
+    projects = db.get_projects()
+    position = db.get_position()
+    return {"projects": projects, "position": position}
 
 
 def save_data(data):
-    try:
-        with open(DATA_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-    except OSError:
-        pass
+    db = get_db()
+    db.save_all(data.get("projects", []), data.get("position"))
 
 
 # ============================================================
@@ -365,6 +631,13 @@ class TaskDetailOverlay(QWidget):
         header.addWidget(close_btn)
         layout.addLayout(header)
 
+        self.date_label = QLabel("")
+        self.date_label.setStyleSheet(
+            "color: #5a5a7a; font-size: 11px; font-family: 'Segoe UI';"
+            "background: transparent; padding: 0 2px;"
+        )
+        layout.addWidget(self.date_label)
+
         sep = QFrame()
         sep.setFixedHeight(1)
         sep.setStyleSheet("background: rgba(167, 139, 250, 0.1);")
@@ -467,9 +740,19 @@ class TaskDetailOverlay(QWidget):
         painter.drawRoundedRect(self.rect().adjusted(5, 5, -5, -5), 18, 18)
         painter.end()
 
-    def open_for(self, task_item):
+    def open_for(self, task_item, project_id=None):
         self._task_item = task_item
         self.text_edit.setPlainText(task_item.task_text)
+        date_text = ""
+        if project_id is not None:
+            created = get_db().get_task_created_at(project_id, task_item.task_text)
+            if created:
+                try:
+                    dt = datetime.strptime(created, "%Y-%m-%d %H:%M:%S")
+                    date_text = f"Created: {dt.strftime('%d %b %Y, %I:%M %p')}"
+                except ValueError:
+                    date_text = f"Created: {created}"
+        self.date_label.setText(date_text)
         if self.parent() is not None:
             self.setGeometry(self.parent().rect())
         self.show()
@@ -500,6 +783,342 @@ class TaskDetailOverlay(QWidget):
 
 
 # ============================================================
+# CredentialItem - single credential row
+# ============================================================
+class CredentialItem(QWidget):
+    deleted = pyqtSignal(object)
+    edit_requested = pyqtSignal(object)
+
+    def __init__(self, cred_data, parent=None):
+        super().__init__(parent)
+        self.cred = cred_data
+        self._password_visible = False
+        self.setFixedHeight(62)
+        self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self._build_ui()
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 8, 10, 8)
+        layout.setSpacing(2)
+
+        top_row = QHBoxLayout()
+        top_row.setSpacing(8)
+
+        self.company_label = QLabel(self.cred["company"])
+        self.company_label.setStyleSheet(
+            "color: #e2e0f0; font-size: 13px; font-weight: bold;"
+            "font-family: 'Segoe UI'; background: transparent;"
+        )
+        top_row.addWidget(self.company_label, 1)
+
+        self.copy_user_btn = QPushButton("ID")
+        self.copy_user_btn.setFixedSize(28, 22)
+        self.copy_user_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.copy_user_btn.setToolTip("Copy username")
+        self.copy_user_btn.clicked.connect(self._copy_username)
+        self.copy_user_btn.setStyleSheet("""
+            QPushButton {
+                background: rgba(167,139,250,0.12);
+                color: #a78bfa; border: none; border-radius: 6px;
+                font-size: 10px; font-weight: bold; font-family: 'Segoe UI';
+            }
+            QPushButton:hover { background: rgba(167,139,250,0.25); }
+        """)
+        top_row.addWidget(self.copy_user_btn)
+
+        self.copy_pass_btn = QPushButton("PW")
+        self.copy_pass_btn.setFixedSize(28, 22)
+        self.copy_pass_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.copy_pass_btn.setToolTip("Copy password")
+        self.copy_pass_btn.clicked.connect(self._copy_password)
+        self.copy_pass_btn.setStyleSheet("""
+            QPushButton {
+                background: rgba(99,102,241,0.15);
+                color: #6366f1; border: none; border-radius: 6px;
+                font-size: 10px; font-weight: bold; font-family: 'Segoe UI';
+            }
+            QPushButton:hover { background: rgba(99,102,241,0.3); }
+        """)
+        top_row.addWidget(self.copy_pass_btn)
+
+        self.del_btn = QPushButton("−")
+        self.del_btn.setFixedSize(22, 22)
+        self.del_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.del_btn.clicked.connect(lambda: self.deleted.emit(self))
+        self.del_btn.setStyleSheet("""
+            QPushButton {
+                background: transparent; color: #ef4444;
+                border: none; font-size: 16px; font-weight: bold; border-radius: 11px;
+            }
+            QPushButton:hover { background: rgba(239,68,68,0.12); }
+        """)
+        self.del_btn.setVisible(False)
+        top_row.addWidget(self.del_btn)
+        layout.addLayout(top_row)
+
+        bottom_row = QHBoxLayout()
+        bottom_row.setSpacing(6)
+        self.user_label = QLabel(self.cred["username"])
+        self.user_label.setStyleSheet(
+            "color: #5a5a7a; font-size: 11px; font-family: 'Segoe UI'; background: transparent;"
+        )
+        bottom_row.addWidget(self.user_label, 1)
+
+        if self.cred.get("created_at"):
+            try:
+                dt = datetime.strptime(self.cred["created_at"], "%Y-%m-%d %H:%M:%S")
+                date_str = dt.strftime("%d %b %Y")
+            except ValueError:
+                date_str = ""
+            if date_str:
+                date_lbl = QLabel(date_str)
+                date_lbl.setStyleSheet(
+                    "color: #3a3a50; font-size: 10px; font-family: 'Segoe UI'; background: transparent;"
+                )
+                bottom_row.addWidget(date_lbl)
+        layout.addLayout(bottom_row)
+
+    def _copy_username(self):
+        QApplication.clipboard().setText(self.cred["username"])
+        self.copy_user_btn.setText("✓")
+        QTimer.singleShot(1000, lambda: self.copy_user_btn.setText("ID"))
+
+    def _copy_password(self):
+        pw = get_db().decrypt_password(self.cred["password_enc"])
+        QApplication.clipboard().setText(pw)
+        self.copy_pass_btn.setText("✓")
+        QTimer.singleShot(1000, lambda: self.copy_pass_btn.setText("PW"))
+
+    def enterEvent(self, event):
+        self.del_btn.setVisible(True)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self.del_btn.setVisible(False)
+        super().leaveEvent(event)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.edit_requested.emit(self)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rect = self.rect().adjusted(2, 1, -2, -1)
+        if self.underMouse():
+            painter.setBrush(QColor(167, 139, 250, 18))
+            painter.setPen(QPen(QColor(167, 139, 250, 50), 1))
+        else:
+            painter.setBrush(QColor(255, 255, 255, 8))
+            painter.setPen(QPen(QColor(255, 255, 255, 15), 1))
+        painter.drawRoundedRect(rect, 10, 10)
+        painter.end()
+
+
+# ============================================================
+# CredentialFormOverlay - add/edit credential
+# ============================================================
+class CredentialFormOverlay(QWidget):
+    saved = pyqtSignal(dict)
+    closed = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._edit_id = None
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, False)
+        self._build_ui()
+        self.hide()
+
+    def _make_input(self, placeholder, is_password=False):
+        inp = QLineEdit()
+        inp.setPlaceholderText(placeholder)
+        inp.setFixedHeight(36)
+        if is_password:
+            inp.setEchoMode(QLineEdit.EchoMode.Password)
+        inp.setStyleSheet("""
+            QLineEdit {
+                background: rgba(255,255,255,0.04); color: #d4d4e8;
+                border: 1px solid rgba(167,139,250,0.12); border-radius: 10px;
+                padding: 0 12px; font-size: 12px; font-family: 'Segoe UI';
+                selection-background-color: #6366f1;
+            }
+            QLineEdit:focus {
+                border-color: rgba(167,139,250,0.4);
+                background: rgba(167,139,250,0.06);
+            }
+            QLineEdit::placeholder { color: #4a4a60; }
+        """)
+        return inp
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 18, 20, 16)
+        layout.setSpacing(10)
+
+        header = QHBoxLayout()
+        header.setSpacing(8)
+        self.form_title = QLabel("Add Credential")
+        self.form_title.setStyleSheet(
+            "color: #e2e0f0; font-size: 15px; font-weight: bold;"
+            "font-family: 'Segoe UI'; letter-spacing: 0.5px; background: transparent;"
+        )
+        header.addWidget(self.form_title)
+        header.addStretch()
+        close_btn = QPushButton("×")
+        close_btn.setFixedSize(30, 30)
+        close_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        close_btn.clicked.connect(self._on_close)
+        close_btn.setStyleSheet("""
+            QPushButton {
+                background: rgba(255,255,255,0.04); color: #888;
+                border: none; border-radius: 15px; font-size: 18px; font-family: 'Segoe UI';
+            }
+            QPushButton:hover { background: rgba(239,68,68,0.15); color: #ef4444; }
+        """)
+        header.addWidget(close_btn)
+        layout.addLayout(header)
+
+        sep = QFrame()
+        sep.setFixedHeight(1)
+        sep.setStyleSheet("background: rgba(167, 139, 250, 0.1);")
+        layout.addWidget(sep)
+
+        self.company_input = self._make_input("Company name")
+        layout.addWidget(self.company_input)
+        self.username_input = self._make_input("Username / Email")
+        layout.addWidget(self.username_input)
+
+        pw_row = QHBoxLayout()
+        pw_row.setSpacing(6)
+        self.password_input = self._make_input("Password", is_password=True)
+        pw_row.addWidget(self.password_input)
+        self.toggle_pw_btn = QPushButton("\U0001F441")
+        self.toggle_pw_btn.setFixedSize(36, 36)
+        self.toggle_pw_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.toggle_pw_btn.clicked.connect(self._toggle_password_visibility)
+        self.toggle_pw_btn.setStyleSheet("""
+            QPushButton {
+                background: rgba(255,255,255,0.04); color: #5a5a7a;
+                border: 1px solid rgba(167,139,250,0.12); border-radius: 10px;
+                font-size: 14px;
+            }
+            QPushButton:hover { background: rgba(167,139,250,0.12); }
+        """)
+        pw_row.addWidget(self.toggle_pw_btn)
+        layout.addLayout(pw_row)
+
+        self.url_input = self._make_input("URL (optional)")
+        layout.addWidget(self.url_input)
+
+        layout.addStretch()
+
+        footer = QHBoxLayout()
+        footer.addStretch()
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.setFixedHeight(34)
+        cancel_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        cancel_btn.clicked.connect(self._on_close)
+        cancel_btn.setStyleSheet("""
+            QPushButton {
+                background: transparent; color: #9ca3af;
+                border: 1px solid rgba(255,255,255,0.08); border-radius: 10px;
+                padding: 0 16px; font-size: 12px; font-family: 'Segoe UI';
+            }
+            QPushButton:hover { background: rgba(255,255,255,0.05); color: #d4d4e8; }
+        """)
+        footer.addWidget(cancel_btn)
+        save_btn = QPushButton("Save")
+        save_btn.setFixedHeight(34)
+        save_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        save_btn.clicked.connect(self._on_save)
+        save_btn.setStyleSheet("""
+            QPushButton {
+                background: qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #a78bfa,stop:1 #6366f1);
+                color: white; border: none; border-radius: 10px;
+                padding: 0 20px; font-size: 12px; font-weight: bold; font-family: 'Segoe UI';
+            }
+            QPushButton:hover {
+                background: qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #b89dff,stop:1 #7577ff);
+            }
+        """)
+        footer.addWidget(save_btn)
+        layout.addLayout(footer)
+
+    def _toggle_password_visibility(self):
+        if self.password_input.echoMode() == QLineEdit.EchoMode.Password:
+            self.password_input.setEchoMode(QLineEdit.EchoMode.Normal)
+        else:
+            self.password_input.setEchoMode(QLineEdit.EchoMode.Password)
+
+    def open_new(self):
+        self._edit_id = None
+        self.form_title.setText("Add Credential")
+        self.company_input.clear()
+        self.username_input.clear()
+        self.password_input.clear()
+        self.url_input.clear()
+        self.password_input.setEchoMode(QLineEdit.EchoMode.Password)
+        if self.parent() is not None:
+            self.setGeometry(self.parent().rect())
+        self.show()
+        self.raise_()
+        self.company_input.setFocus()
+
+    def open_edit(self, cred):
+        self._edit_id = cred["id"]
+        self.form_title.setText("Edit Credential")
+        self.company_input.setText(cred["company"])
+        self.username_input.setText(cred["username"])
+        self.password_input.setText(get_db().decrypt_password(cred["password_enc"]))
+        self.url_input.setText(cred.get("url", ""))
+        self.password_input.setEchoMode(QLineEdit.EchoMode.Password)
+        if self.parent() is not None:
+            self.setGeometry(self.parent().rect())
+        self.show()
+        self.raise_()
+        self.company_input.setFocus()
+
+    def _on_save(self):
+        company = self.company_input.text().strip()
+        username = self.username_input.text().strip()
+        password = self.password_input.text()
+        url = self.url_input.text().strip()
+        if not company or not username or not password:
+            return
+        self.saved.emit({
+            "id": self._edit_id, "company": company,
+            "username": username, "password": password, "url": url
+        })
+        self._edit_id = None
+        self.hide()
+        self.closed.emit()
+
+    def _on_close(self):
+        self._edit_id = None
+        self.hide()
+        self.closed.emit()
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape:
+            self._on_close()
+            return
+        super().keyPressEvent(event)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        for i in range(5):
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QPen(QColor(0, 0, 0, 12 - i * 2), 1))
+            painter.drawRoundedRect(self.rect().adjusted(i, i, -i, -i), 20, 20)
+        painter.setPen(QPen(QColor(167, 139, 250, 60), 1))
+        painter.setBrush(QColor(13, 13, 25, 252))
+        painter.drawRoundedRect(self.rect().adjusted(5, 5, -5, -5), 18, 18)
+        painter.end()
+
+
+# ============================================================
 # PopupPanel - with project/task navigation
 # ============================================================
 class PopupPanel(QWidget):
@@ -522,6 +1141,7 @@ class PopupPanel(QWidget):
         # Data
         self.projects = []  # list of {"name": str, "tasks": list}
         self._current_project_idx = None
+        self._vault_mode = False
 
         self._build_ui()
 
@@ -529,6 +1149,11 @@ class PopupPanel(QWidget):
         self.detail = TaskDetailOverlay(self)
         self.detail.saved.connect(self._on_detail_saved)
         self.detail.setGeometry(self.rect())
+
+        # Credential form overlay
+        self.cred_form = CredentialFormOverlay(self)
+        self.cred_form.saved.connect(self._on_cred_saved)
+        self.cred_form.setGeometry(self.rect())
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -592,6 +1217,27 @@ class PopupPanel(QWidget):
         )
         self.header_layout.addWidget(self.title_label)
         self.header_layout.addStretch()
+
+        self.vault_btn = QPushButton("\U0001F512")
+        self.vault_btn.setFixedSize(30, 30)
+        self.vault_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.vault_btn.setToolTip("Password Vault")
+        self.vault_btn.clicked.connect(self._toggle_vault)
+        self.vault_btn.setStyleSheet("""
+            QPushButton {
+                background: rgba(255,255,255,0.04);
+                color: #5a5a7a;
+                border: none;
+                border-radius: 15px;
+                font-size: 14px;
+                font-family: 'Segoe UI';
+            }
+            QPushButton:hover {
+                background: rgba(167,139,250,0.12);
+                color: #a78bfa;
+            }
+        """)
+        self.header_layout.addWidget(self.vault_btn)
 
         close_btn = QPushButton("\u00d7")
         close_btn.setFixedSize(30, 30)
@@ -672,9 +1318,69 @@ class PopupPanel(QWidget):
         """)
         self.input_row.addWidget(self.add_btn)
 
-        input_widget = QWidget()
-        input_widget.setLayout(self.input_row)
-        main_layout.addWidget(input_widget)
+        self.task_input_widget = QWidget()
+        self.task_input_widget.setLayout(self.input_row)
+        main_layout.addWidget(self.task_input_widget)
+
+        # --- Vault input fields (hidden by default) ---
+        vault_input_style = """
+            QLineEdit {
+                background: rgba(255,255,255,0.04); color: #d4d4e8;
+                border: 1px solid rgba(167,139,250,0.12); border-radius: 10px;
+                padding: 0 12px; font-size: 12px; font-family: 'Segoe UI';
+                selection-background-color: #6366f1;
+            }
+            QLineEdit:focus {
+                border-color: rgba(167,139,250,0.4);
+                background: rgba(167,139,250,0.06);
+            }
+            QLineEdit::placeholder { color: #4a4a60; }
+        """
+        self.vault_input_widget = QWidget()
+        vault_layout = QVBoxLayout(self.vault_input_widget)
+        vault_layout.setContentsMargins(0, 0, 0, 0)
+        vault_layout.setSpacing(6)
+
+        self.vault_company = QLineEdit()
+        self.vault_company.setPlaceholderText("Company / Title")
+        self.vault_company.setFixedHeight(34)
+        self.vault_company.setStyleSheet(vault_input_style)
+        vault_layout.addWidget(self.vault_company)
+
+        cred_row = QHBoxLayout()
+        cred_row.setSpacing(6)
+        self.vault_username = QLineEdit()
+        self.vault_username.setPlaceholderText("Email / Username")
+        self.vault_username.setFixedHeight(34)
+        self.vault_username.setStyleSheet(vault_input_style)
+        cred_row.addWidget(self.vault_username)
+
+        self.vault_password = QLineEdit()
+        self.vault_password.setPlaceholderText("Password")
+        self.vault_password.setFixedHeight(34)
+        self.vault_password.setEchoMode(QLineEdit.EchoMode.Password)
+        self.vault_password.setStyleSheet(vault_input_style)
+        cred_row.addWidget(self.vault_password)
+
+        self.vault_add_btn = QPushButton("+")
+        self.vault_add_btn.setFixedSize(34, 34)
+        self.vault_add_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.vault_add_btn.clicked.connect(self._vault_add_credential)
+        self.vault_add_btn.setStyleSheet("""
+            QPushButton {
+                background: qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #a78bfa,stop:1 #6366f1);
+                color: white; border: none; border-radius: 10px;
+                font-size: 20px; font-weight: bold; font-family: 'Segoe UI';
+            }
+            QPushButton:hover {
+                background: qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #b89dff,stop:1 #7577ff);
+            }
+        """)
+        cred_row.addWidget(self.vault_add_btn)
+        vault_layout.addLayout(cred_row)
+
+        self.vault_input_widget.setVisible(False)
+        main_layout.addWidget(self.vault_input_widget)
 
         # --- Scrollable content ---
         self.scroll = QScrollArea()
@@ -762,18 +1468,23 @@ class PopupPanel(QWidget):
 
     def _show_projects_view(self):
         self._current_project_idx = None
+        self._vault_mode = False
+        self.vault_btn.setText("\U0001F512")
         self.back_btn.setVisible(False)
         self.title_label.setText("FloatTask")
         self.input_field.setPlaceholderText("New project name...")
+        self.input_field.clear()
         self.clear_btn.setVisible(False)
+        self.task_input_widget.setVisible(True)
+        self.vault_input_widget.setVisible(False)
         self._clear_list()
 
-        for i, proj in enumerate(self.projects):
+        for proj in reversed(self.projects):
             pending = sum(1 for t in proj["tasks"] if not t.get("done", False))
             item = ProjectItem(proj["name"], len(proj["tasks"]), pending)
             item.clicked.connect(self._open_project)
             item.deleted.connect(self._delete_project)
-            self.list_layout.insertWidget(self.list_layout.count() - 1, item)
+            self.list_layout.insertWidget(0, item)
 
         total_projects = len(self.projects)
         total_pending = sum(
@@ -809,11 +1520,12 @@ class PopupPanel(QWidget):
         self.input_field.clear()
 
         if self._current_project_idx is None:
-            # Add project
-            self.projects.append({"name": text, "tasks": []})
+            pid = get_db().add_project(text)
+            self.projects.append({"id": pid, "name": text, "tasks": []})
             self._show_projects_view()
         else:
-            # Add task
+            proj = self.projects[self._current_project_idx]
+            get_db().add_task(proj["id"], text)
             self._create_task_widget(text, False)
             self._update_task_footer()
 
@@ -828,6 +1540,7 @@ class PopupPanel(QWidget):
     def _delete_project(self, item):
         for i, proj in enumerate(self.projects):
             if proj["name"] == item.project_name:
+                get_db().delete_project(proj["id"])
                 self.projects.pop(i)
                 break
         self._show_projects_view()
@@ -852,20 +1565,33 @@ class PopupPanel(QWidget):
         self._sort_tasks()
 
     def _open_detail(self, item):
-        self.detail.open_for(item)
+        pid = None
+        if self._current_project_idx is not None:
+            pid = self.projects[self._current_project_idx].get("id")
+        self.detail.open_for(item, pid)
 
     def _on_detail_saved(self, item, new_text):
+        if self._current_project_idx is not None:
+            proj = self.projects[self._current_project_idx]
+            get_db().update_task_text(proj["id"], item.task_text, new_text)
         item.set_text(new_text)
         self._sync_tasks_to_data()
         self.data_changed.emit()
 
     def _on_task_changed(self):
+        sender = self.sender() if hasattr(self, 'sender') else None
+        if self._current_project_idx is not None and sender:
+            proj = self.projects[self._current_project_idx]
+            get_db().toggle_task(proj["id"], sender.task_text, sender.done)
         self._sort_tasks()
         self._update_task_footer()
         self._sync_tasks_to_data()
         self.data_changed.emit()
 
     def _delete_task(self, item):
+        if self._current_project_idx is not None:
+            proj = self.projects[self._current_project_idx]
+            get_db().delete_task(proj["id"], item.task_text)
         self._task_items.remove(item)
         self.list_layout.removeWidget(item)
         item.deleteLater()
@@ -876,6 +1602,9 @@ class PopupPanel(QWidget):
     def _clear_done(self):
         if not hasattr(self, '_task_items'):
             return
+        if self._current_project_idx is not None:
+            proj = self.projects[self._current_project_idx]
+            get_db().clear_done_tasks(proj["id"])
         done_items = [i for i in self._task_items if i.done]
         for item in done_items:
             self._task_items.remove(item)
@@ -892,7 +1621,8 @@ class PopupPanel(QWidget):
             self.list_layout.removeWidget(item)
         pending = [i for i in self._task_items if not i.done]
         done = [i for i in self._task_items if i.done]
-        for i, item in enumerate(pending + done):
+        # Newest first — reverse pending so last-added shows on top
+        for i, item in enumerate(list(reversed(pending)) + done):
             self.list_layout.insertWidget(i, item)
 
     def _update_task_footer(self):
@@ -907,6 +1637,66 @@ class PopupPanel(QWidget):
             self.projects[self._current_project_idx]["tasks"] = [
                 i.to_dict() for i in self._task_items
             ]
+
+    # --- Vault actions ---
+    def _toggle_vault(self):
+        if self._vault_mode:
+            self._vault_mode = False
+            self.vault_btn.setText("\U0001F512")
+            self._show_projects_view()
+        else:
+            self._vault_mode = True
+            self.vault_btn.setText("\U0001F4CB")
+            self._show_vault_view()
+
+    def _show_vault_view(self):
+        self._current_project_idx = None
+        self.back_btn.setVisible(False)
+        self.title_label.setText("Vault")
+        self.clear_btn.setVisible(False)
+        self.task_input_widget.setVisible(False)
+        self.vault_input_widget.setVisible(True)
+        self.vault_company.clear()
+        self.vault_username.clear()
+        self.vault_password.clear()
+        self._clear_list()
+        self._load_credentials()
+
+    def _vault_add_credential(self):
+        company = self.vault_company.text().strip()
+        username = self.vault_username.text().strip()
+        password = self.vault_password.text()
+        if not company or not username or not password:
+            return
+        get_db().add_credential(company, username, password)
+        self.vault_company.clear()
+        self.vault_username.clear()
+        self.vault_password.clear()
+        self.vault_company.setFocus()
+        self._load_credentials()
+
+    def _load_credentials(self):
+        self._clear_list()
+        creds = get_db().get_credentials()
+        for cred in creds:
+            item = CredentialItem(cred)
+            item.deleted.connect(self._delete_credential)
+            item.edit_requested.connect(self._edit_credential)
+            self.list_layout.insertWidget(self.list_layout.count() - 1, item)
+        self.status_label.setText(f"{len(creds)} credentials")
+
+    def _edit_credential(self, item):
+        self.cred_form.open_edit(item.cred)
+
+    def _delete_credential(self, item):
+        get_db().delete_credential(item.cred["id"])
+        self._load_credentials()
+
+    def _on_cred_saved(self, data):
+        if data["id"] is not None:
+            get_db().update_credential(data["id"], data["company"], data["username"],
+                                       data["password"], data.get("url", ""))
+        self._load_credentials()
 
     # --- Public API ---
     def get_all_pending_count(self):
@@ -924,6 +1714,8 @@ class PopupPanel(QWidget):
         super().resizeEvent(event)
         if hasattr(self, "detail"):
             self.detail.setGeometry(self.rect())
+        if hasattr(self, "cred_form"):
+            self.cred_form.setGeometry(self.rect())
 
     def _close(self):
         self._sync_tasks_to_data()
@@ -983,12 +1775,14 @@ class FloatingCircle(QWidget):
         self.panel.load_projects(data.get("projects", []))
         self._pending_count = self.panel.get_all_pending_count()
 
-        # Restore position
+        # Restore position (clamp to visible screen area)
+        screen = QApplication.primaryScreen().geometry()
         pos = data.get("position")
         if pos and isinstance(pos, list) and len(pos) == 2:
-            self.move(pos[0], pos[1])
+            x = max(0, min(pos[0], screen.width() - self.CIRCLE_SIZE))
+            y = max(0, min(pos[1], screen.height() - self.CIRCLE_SIZE))
+            self.move(x, y)
         else:
-            screen = QApplication.primaryScreen().geometry()
             self.move(screen.width() - self.CIRCLE_SIZE - 40, 30)
 
         # Glow animation
@@ -1103,11 +1897,7 @@ class FloatingCircle(QWidget):
         self._save_all()
 
     def _save_all(self):
-        data = {
-            "projects": self.panel.get_projects_data(),
-            "position": [self.pos().x(), self.pos().y()]
-        }
-        save_data(data)
+        get_db().save_position([self.pos().x(), self.pos().y()])
 
 
 # ============================================================
@@ -1123,7 +1913,20 @@ def acquire_single_instance_lock():
         lock_file.flush()
         return lock_file
     except (OSError, IOError):
-        return None
+        try:
+            lock_file.close()
+        except Exception:
+            pass
+        # Stale lock from unclean shutdown — remove and retry
+        try:
+            lock_path.unlink(missing_ok=True)
+            lock_file = open(lock_path, "w")
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+            lock_file.write(str(sys.executable))
+            lock_file.flush()
+            return lock_file
+        except (OSError, IOError):
+            return None
 
 
 def main():
