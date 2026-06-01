@@ -14,7 +14,8 @@ import sqlite3
 import ctypes
 import ctypes.wintypes
 import base64
-from datetime import datetime
+import calendar
+from datetime import datetime, date, timedelta
 from pathlib import Path
 
 from PyQt6.QtWidgets import (
@@ -246,6 +247,44 @@ class FloatTaskDB:
             "SELECT created_at FROM tasks WHERE project_id=? AND text=? AND deleted_at IS NULL",
             (project_id, text)).fetchone()
         return row[0] if row else None
+
+    def get_active_days(self, year, month):
+        prefix = f"{year:04d}-{month:02d}"
+        created = self.conn.execute(
+            "SELECT DISTINCT substr(created_at,1,10) FROM tasks WHERE created_at LIKE ? AND deleted_at IS NULL",
+            (prefix + "%",)).fetchall()
+        completed = self.conn.execute(
+            "SELECT DISTINCT substr(completed_at,1,10) FROM tasks WHERE completed_at LIKE ? AND deleted_at IS NULL",
+            (prefix + "%",)).fetchall()
+        days = {}
+        for (d,) in created:
+            days.setdefault(d, set()).add("created")
+        for (d,) in completed:
+            if d:
+                days.setdefault(d, set()).add("completed")
+        return days
+
+    def get_tasks_for_date(self, date_str):
+        created = self.conn.execute(
+            "SELECT t.id, t.project_id, t.text, p.name, 'created' FROM tasks t JOIN projects p ON t.project_id=p.id "
+            "WHERE substr(t.created_at,1,10)=? AND t.deleted_at IS NULL",
+            (date_str,)).fetchall()
+        completed = self.conn.execute(
+            "SELECT t.id, t.project_id, t.text, p.name, 'completed' FROM tasks t JOIN projects p ON t.project_id=p.id "
+            "WHERE substr(t.completed_at,1,10)=? AND t.deleted_at IS NULL",
+            (date_str,)).fetchall()
+        return [{"id": r[0], "project_id": r[1], "text": r[2], "project": r[3], "action": r[4]} for r in created + completed]
+
+    def update_task_by_id(self, task_id, new_text):
+        self.conn.execute("UPDATE tasks SET text=? WHERE id=?", (new_text, task_id))
+        self._log("task_edited", task_id, None, new_text)
+        self.conn.commit()
+
+    def delete_task_by_id(self, task_id):
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.conn.execute("UPDATE tasks SET deleted_at=? WHERE id=?", (now, task_id))
+        self._log("task_deleted", task_id, None)
+        self.conn.commit()
 
     # --- Credentials ---
     def get_credentials(self):
@@ -1119,6 +1158,378 @@ class CredentialFormOverlay(QWidget):
 
 
 # ============================================================
+# CalendarView - month calendar with task activity
+# ============================================================
+class CalendarDayButton(QPushButton):
+    day_clicked = pyqtSignal(str)
+
+    def __init__(self, day_num, date_str, has_created=False, has_completed=False, is_today=False, parent=None):
+        super().__init__(str(day_num), parent)
+        self._date_str = date_str
+        self.setFixedSize(36, 36)
+        self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.clicked.connect(lambda: self.day_clicked.emit(self._date_str))
+
+        bg = "transparent"
+        color = "#5a5a7a"
+        border = "none"
+        if is_today:
+            border = "1px solid #a78bfa"
+            color = "#e2e0f0"
+        if has_created and has_completed:
+            bg = "qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 rgba(99,102,241,0.3),stop:1 rgba(34,197,94,0.3))"
+            color = "#e2e0f0"
+        elif has_created:
+            bg = "rgba(99,102,241,0.25)"
+            color = "#c4b5fd"
+        elif has_completed:
+            bg = "rgba(34,197,94,0.25)"
+            color = "#86efac"
+
+        self.setStyleSheet(f"""
+            QPushButton {{
+                background: {bg}; color: {color};
+                border: {border}; border-radius: 18px;
+                font-size: 12px; font-family: 'Segoe UI'; font-weight: bold;
+            }}
+            QPushButton:hover {{
+                background: rgba(167,139,250,0.2); color: #e2e0f0;
+            }}
+        """)
+
+
+class CalendarView(QWidget):
+    closed = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._year = date.today().year
+        self._month = date.today().month
+        self._current_date = None
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, False)
+        self._build_ui()
+        self.hide()
+
+    def _build_ui(self):
+        self._layout = QVBoxLayout(self)
+        self._layout.setContentsMargins(16, 14, 16, 12)
+        self._layout.setSpacing(8)
+
+        # Nav header
+        nav = QHBoxLayout()
+        nav.setSpacing(6)
+
+        self.back_to_cal_btn = QPushButton("‹")
+        self.back_to_cal_btn.setFixedSize(28, 28)
+        self.back_to_cal_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.back_to_cal_btn.clicked.connect(self._back_to_calendar)
+        self.back_to_cal_btn.setStyleSheet("""
+            QPushButton { background: rgba(255,255,255,0.04); color: #a78bfa;
+                border: none; border-radius: 14px; font-size: 18px; font-family: 'Segoe UI'; }
+            QPushButton:hover { background: rgba(167,139,250,0.12); }
+        """)
+        self.back_to_cal_btn.setVisible(False)
+        nav.addWidget(self.back_to_cal_btn)
+
+        self.prev_btn = QPushButton("‹")
+        self.prev_btn.setFixedSize(28, 28)
+        self.prev_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.prev_btn.clicked.connect(self._prev_month)
+        self.prev_btn.setStyleSheet("""
+            QPushButton { background: rgba(255,255,255,0.04); color: #a78bfa;
+                border: none; border-radius: 14px; font-size: 18px; font-family: 'Segoe UI'; }
+            QPushButton:hover { background: rgba(167,139,250,0.12); }
+        """)
+        nav.addWidget(self.prev_btn)
+
+        self.month_label = QLabel()
+        self.month_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.month_label.setStyleSheet(
+            "color: #e2e0f0; font-size: 14px; font-weight: bold;"
+            "font-family: 'Segoe UI'; background: transparent;"
+        )
+        nav.addWidget(self.month_label, 1)
+
+        self.next_btn = QPushButton("›")
+        self.next_btn.setFixedSize(28, 28)
+        self.next_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.next_btn.clicked.connect(self._next_month)
+        self.next_btn.setStyleSheet(self.prev_btn.styleSheet())
+        nav.addWidget(self.next_btn)
+
+        close_btn = QPushButton("×")
+        close_btn.setFixedSize(28, 28)
+        close_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        close_btn.clicked.connect(self._on_close)
+        close_btn.setStyleSheet("""
+            QPushButton { background: rgba(255,255,255,0.04); color: #555;
+                border: none; border-radius: 14px; font-size: 16px; font-family: 'Segoe UI'; }
+            QPushButton:hover { background: rgba(239,68,68,0.15); color: #ef4444; }
+        """)
+        nav.addWidget(close_btn)
+        self._layout.addLayout(nav)
+
+        # Day headers
+        days_header_widget = QWidget()
+        days_header = QHBoxLayout(days_header_widget)
+        days_header.setContentsMargins(0, 0, 0, 0)
+        days_header.setSpacing(2)
+        for d in ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"]:
+            lbl = QLabel(d)
+            lbl.setFixedSize(36, 20)
+            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            lbl.setStyleSheet("color: #4a4a6a; font-size: 10px; font-family: 'Segoe UI'; font-weight: bold; background: transparent;")
+            days_header.addWidget(lbl)
+        self._layout.addWidget(days_header_widget)
+
+        # Calendar grid container
+        self.grid_widget = QWidget()
+        self.grid_layout = QVBoxLayout(self.grid_widget)
+        self.grid_layout.setContentsMargins(0, 0, 0, 0)
+        self.grid_layout.setSpacing(2)
+        self._layout.addWidget(self.grid_widget)
+
+        # Legend
+        self.legend_widget = QWidget()
+        legend = QHBoxLayout(self.legend_widget)
+        legend.setContentsMargins(0, 0, 0, 0)
+        legend.setSpacing(12)
+        for color, text in [("rgba(99,102,241,0.4)", "Created"), ("rgba(34,197,94,0.4)", "Completed")]:
+            dot = QLabel()
+            dot.setFixedSize(8, 8)
+            dot.setStyleSheet(f"background: {color}; border-radius: 4px;")
+            legend.addWidget(dot)
+            lbl = QLabel(text)
+            lbl.setStyleSheet("color: #4a4a6a; font-size: 10px; font-family: 'Segoe UI'; background: transparent;")
+            legend.addWidget(lbl)
+        legend.addStretch()
+        self._layout.addWidget(self.legend_widget)
+
+        # Day headers widget (to show/hide)
+        self.days_header_widget = days_header_widget
+
+        # --- Day detail view (hidden by default) ---
+        self.day_title = QLabel()
+        self.day_title.setStyleSheet(
+            "color: #a78bfa; font-size: 13px; font-weight: bold;"
+            "font-family: 'Segoe UI'; background: transparent;"
+        )
+        self.day_title.setVisible(False)
+        self._layout.addWidget(self.day_title)
+
+        self.day_scroll = QScrollArea()
+        self.day_scroll.setWidgetResizable(True)
+        self.day_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.day_scroll.setStyleSheet("""
+            QScrollArea { background: transparent; border: none; }
+            QWidget { background: transparent; }
+            QScrollBar:vertical { background: transparent; width: 4px; }
+            QScrollBar::handle:vertical { background: rgba(167,139,250,0.25); border-radius: 2px; min-height: 20px; }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical,
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; height: 0; }
+        """)
+        self.day_list = QWidget()
+        self.day_list_layout = QVBoxLayout(self.day_list)
+        self.day_list_layout.setContentsMargins(0, 2, 0, 2)
+        self.day_list_layout.setSpacing(4)
+        self.day_list_layout.addStretch()
+        self.day_scroll.setWidget(self.day_list)
+        self.day_scroll.setVisible(False)
+        self._layout.addWidget(self.day_scroll, 1)
+
+    def show_calendar(self):
+        if self.parent() is not None:
+            self.setGeometry(self.parent().rect())
+        self._back_to_calendar()
+        self.show()
+        self.raise_()
+
+    def _render_month(self):
+        # Clear grid
+        while self.grid_layout.count():
+            row = self.grid_layout.takeAt(0)
+            if row.layout():
+                while row.layout().count():
+                    item = row.layout().takeAt(0)
+                    if item.widget():
+                        item.widget().deleteLater()
+
+        self.month_label.setText(f"{calendar.month_name[self._month]} {self._year}")
+        active_days = get_db().get_active_days(self._year, self._month)
+        today = date.today()
+        cal = calendar.monthcalendar(self._year, self._month)
+
+        for week in cal:
+            row_layout = QHBoxLayout()
+            row_layout.setSpacing(2)
+            for day in week:
+                if day == 0:
+                    spacer = QLabel()
+                    spacer.setFixedSize(36, 36)
+                    row_layout.addWidget(spacer)
+                else:
+                    date_str = f"{self._year:04d}-{self._month:02d}-{day:02d}"
+                    acts = active_days.get(date_str, set())
+                    is_today = (self._year == today.year and self._month == today.month and day == today.day)
+                    btn = CalendarDayButton(day, date_str, "created" in acts, "completed" in acts, is_today)
+                    btn.day_clicked.connect(self._on_day_clicked)
+                    row_layout.addWidget(btn)
+            self.grid_layout.addLayout(row_layout)
+
+    def _on_day_clicked(self, date_str):
+        self._current_date = date_str
+        tasks = get_db().get_tasks_for_date(date_str)
+        try:
+            dt = datetime.strptime(date_str, "%Y-%m-%d")
+            label = dt.strftime("%d %b %Y")
+        except ValueError:
+            label = date_str
+
+        # Clear previous items
+        while self.day_list_layout.count() > 1:
+            item = self.day_list_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        if not tasks:
+            self.day_title.setText(f"{label} — no activity")
+            empty = QLabel("No tasks created or completed")
+            empty.setStyleSheet("color: #4a4a6a; font-size: 12px; font-family: 'Segoe UI'; background: transparent; padding: 16px;")
+            empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.day_list_layout.insertWidget(0, empty)
+        else:
+            self.day_title.setText(f"{label} — {len(tasks)} items")
+            for t in tasks:
+                item_w = QWidget()
+                item_layout = QVBoxLayout(item_w)
+                item_layout.setContentsMargins(10, 6, 10, 6)
+                item_layout.setSpacing(2)
+
+                top = QHBoxLayout()
+                top.setSpacing(6)
+                if t["action"] == "completed":
+                    badge = QLabel("✓")
+                    badge.setFixedSize(20, 20)
+                    badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                    badge.setStyleSheet("background: rgba(34,197,94,0.25); color: #86efac; border-radius: 10px; font-size: 11px; font-weight: bold;")
+                else:
+                    badge = QLabel("+")
+                    badge.setFixedSize(20, 20)
+                    badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                    badge.setStyleSheet("background: rgba(99,102,241,0.25); color: #c4b5fd; border-radius: 10px; font-size: 13px; font-weight: bold;")
+                top.addWidget(badge)
+
+                text_lbl = QLabel(t["text"])
+                text_lbl.setWordWrap(True)
+                text_lbl.setStyleSheet("color: #d4d4e8; font-size: 12px; font-family: 'Segoe UI'; background: transparent;")
+                top.addWidget(text_lbl, 1)
+
+                task_id = t["id"]
+                task_text = t["text"]
+
+                edit_btn = QPushButton("✎")
+                edit_btn.setFixedSize(24, 24)
+                edit_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+                edit_btn.setStyleSheet("""
+                    QPushButton { background: transparent; color: #6366f1; border: none;
+                        border-radius: 12px; font-size: 13px; }
+                    QPushButton:hover { background: rgba(99,102,241,0.15); }
+                """)
+                edit_btn.clicked.connect(lambda checked, tid=task_id, txt=task_text: self._edit_task(tid, txt))
+                top.addWidget(edit_btn)
+
+                del_btn = QPushButton("−")
+                del_btn.setFixedSize(24, 24)
+                del_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+                del_btn.setStyleSheet("""
+                    QPushButton { background: transparent; color: #ef4444; border: none;
+                        border-radius: 12px; font-size: 16px; font-weight: bold; }
+                    QPushButton:hover { background: rgba(239,68,68,0.12); }
+                """)
+                del_btn.clicked.connect(lambda checked, tid=task_id: self._delete_task(tid))
+                top.addWidget(del_btn)
+
+                item_layout.addLayout(top)
+
+                proj_lbl = QLabel(t["project"])
+                proj_lbl.setStyleSheet("color: #4a4a6a; font-size: 10px; font-family: 'Segoe UI'; background: transparent; padding-left: 26px;")
+                item_layout.addWidget(proj_lbl)
+
+                item_w.setStyleSheet("background: rgba(255,255,255,0.03); border-radius: 8px;")
+                self.day_list_layout.insertWidget(self.day_list_layout.count() - 1, item_w)
+
+        # Switch to day detail view
+        self.grid_widget.setVisible(False)
+        self.days_header_widget.setVisible(False)
+        self.legend_widget.setVisible(False)
+        self.prev_btn.setVisible(False)
+        self.next_btn.setVisible(False)
+        self.back_to_cal_btn.setVisible(True)
+        self.day_title.setVisible(True)
+        self.day_scroll.setVisible(True)
+
+    def _edit_task(self, task_id, current_text):
+        from PyQt6.QtWidgets import QInputDialog
+        new_text, ok = QInputDialog.getText(self, "Edit Task", "Task:", text=current_text)
+        if ok and new_text.strip():
+            get_db().update_task_by_id(task_id, new_text.strip())
+            self._on_day_clicked(self._current_date)
+
+    def _delete_task(self, task_id):
+        get_db().delete_task_by_id(task_id)
+        self._on_day_clicked(self._current_date)
+
+    def _back_to_calendar(self):
+        self.day_title.setVisible(False)
+        self.day_scroll.setVisible(False)
+        self.back_to_cal_btn.setVisible(False)
+        self.grid_widget.setVisible(True)
+        self.days_header_widget.setVisible(True)
+        self.legend_widget.setVisible(True)
+        self.prev_btn.setVisible(True)
+        self.next_btn.setVisible(True)
+        self._render_month()
+
+    def _prev_month(self):
+        if self._month == 1:
+            self._month = 12
+            self._year -= 1
+        else:
+            self._month -= 1
+        self._back_to_calendar()
+
+    def _next_month(self):
+        if self._month == 12:
+            self._month = 1
+            self._year += 1
+        else:
+            self._month += 1
+        self._back_to_calendar()
+
+    def _on_close(self):
+        self.hide()
+        self.closed.emit()
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape:
+            self._on_close()
+            return
+        super().keyPressEvent(event)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        for i in range(5):
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QPen(QColor(0, 0, 0, 12 - i * 2), 1))
+            painter.drawRoundedRect(self.rect().adjusted(i, i, -i, -i), 20, 20)
+        painter.setPen(QPen(QColor(167, 139, 250, 60), 1))
+        painter.setBrush(QColor(13, 13, 25, 252))
+        painter.drawRoundedRect(self.rect().adjusted(5, 5, -5, -5), 18, 18)
+        painter.end()
+
+
+# ============================================================
 # PopupPanel - with project/task navigation
 # ============================================================
 class PopupPanel(QWidget):
@@ -1154,6 +1565,10 @@ class PopupPanel(QWidget):
         self.cred_form = CredentialFormOverlay(self)
         self.cred_form.saved.connect(self._on_cred_saved)
         self.cred_form.setGeometry(self.rect())
+
+        # Calendar overlay
+        self.calendar_view = CalendarView(self)
+        self.calendar_view.setGeometry(self.rect())
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -1238,6 +1653,27 @@ class PopupPanel(QWidget):
             }
         """)
         self.header_layout.addWidget(self.vault_btn)
+
+        self.cal_btn = QPushButton("\U0001F4C5")
+        self.cal_btn.setFixedSize(30, 30)
+        self.cal_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.cal_btn.setToolTip("Activity Calendar")
+        self.cal_btn.clicked.connect(self._show_calendar)
+        self.cal_btn.setStyleSheet("""
+            QPushButton {
+                background: rgba(255,255,255,0.04);
+                color: #5a5a7a;
+                border: none;
+                border-radius: 15px;
+                font-size: 14px;
+                font-family: 'Segoe UI';
+            }
+            QPushButton:hover {
+                background: rgba(167,139,250,0.12);
+                color: #a78bfa;
+            }
+        """)
+        self.header_layout.addWidget(self.cal_btn)
 
         close_btn = QPushButton("\u00d7")
         close_btn.setFixedSize(30, 30)
@@ -1639,6 +2075,9 @@ class PopupPanel(QWidget):
             ]
 
     # --- Vault actions ---
+    def _show_calendar(self):
+        self.calendar_view.show_calendar()
+
     def _toggle_vault(self):
         if self._vault_mode:
             self._vault_mode = False
@@ -1716,6 +2155,8 @@ class PopupPanel(QWidget):
             self.detail.setGeometry(self.rect())
         if hasattr(self, "cred_form"):
             self.cred_form.setGeometry(self.rect())
+        if hasattr(self, "calendar_view"):
+            self.calendar_view.setGeometry(self.rect())
 
     def _close(self):
         self._sync_tasks_to_data()
@@ -1885,6 +2326,8 @@ class FloatingCircle(QWidget):
             self._panel_visible = True
 
     def _close_panel(self):
+        if hasattr(self.panel, 'calendar_view'):
+            self.panel.calendar_view.hide()
         self.panel.hide()
         self._panel_visible = False
 
